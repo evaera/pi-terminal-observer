@@ -1,0 +1,55 @@
+{
+  "name": "pi-cmux-observer",
+  "version": "0.1.0",
+  "description": "Context-efficient incremental observation of existing cmux terminal surfaces for Pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/evaera/pi-cmux-observer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/evaera/pi-cmux-observer/issues"
+  },
+  "homepage": "https://github.com/evaera/pi-cmux-observer#readme",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "cmux",
+    "terminal",
+    "observer"
+  ],
+  "files": [
+    "index.ts",
+    "observer.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.81.1",
+    "@earendil-works/pi-coding-agent": "0.81.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.6",
+    "typebox": "1.1.38",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test observer.test.ts",
+    "prepack": "npm run check && npm test"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

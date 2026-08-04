@@ -7,8 +7,8 @@ import { randomBytes } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 
-export const DEFAULT_MAX_LINES = 100;
-export const DEFAULT_MAX_CHARS = 8_000;
+export const DEFAULT_MAX_LINES = 50;
+export const DEFAULT_MAX_CHARS = 4_000;
 export const HARD_MAX_LINES = 500;
 export const HARD_MAX_CHARS = 20_000;
 export const DEFAULT_SPOOL_BYTES = 1024 * 1024;
@@ -50,6 +50,215 @@ export interface ObserverReadResult {
 	ended: boolean;
 	gap: boolean;
 	gapReason?: string;
+}
+
+export type ObserverReadMode = "compact" | "raw";
+
+export interface RenderedObserverRead {
+	text: string;
+	mode: ObserverReadMode;
+	sourceLineCount: number;
+	renderedLineCount: number;
+	omittedLineCount: number;
+}
+
+const IMPORTANT_LINE = /\b(?:errors?|warnings?|warns?|failed|failures?|fatals?|exceptions?|panics?)\b/iu;
+const PROGRESS_TOKEN = /(?:\d{1,3}(?:\.\d+)?%|\b\d+\s*\/\s*\d+\b|\[[#=*>.\- ]{3,}\])/u;
+const PNPM_PROGRESS = /^\s*Progress:\s*resolved\s+\d+,\s*reused\s+\d+,\s*downloaded\s+\d+,\s*added\s+\d+\s*$/iu;
+const PACKAGE_ENTRY = /^\s*@?[a-z0-9][a-z0-9._/-]*(?:==|===|~=|>=|<=|@|\s+v?)[0-9][^\s,]*(?:\s.*)?$/iu;
+const TREE_PACKAGE_ENTRY = /^\s*[├└]─+\s*@?[a-z0-9][a-z0-9._/-]*(?:==|===|~=|>=|<=|@)[0-9][^\s,]*(?:\s.*)?$/iu;
+const SPEC_PACKAGE_ENTRY = /^\s*\+\s+@?[a-z0-9][a-z0-9._/-]*(?:==|===|~=|>=|<=|@)[0-9][^\s,]*(?:\s.*)?$/iu;
+const PACKAGE_CONTEXT = /^\s*(?:packages(?:\s*:|\s+[+-]\d)|(?:dev|optional|peer)?dependencies\s*:|installing packages\s*:)/iu;
+const PACKAGE_LIST = /^(.*\b(?:installing collected packages|resolved dependencies)\s*:\s*)(.+)$/iu;
+
+function isFinalByte(code: number): boolean {
+	return code >= 0x40 && code <= 0x7e;
+}
+
+function skipControlString(line: string, start: number, bellTerminated: boolean): number {
+	let index = start;
+	while (index < line.length) {
+		const code = line.charCodeAt(index);
+		if ((bellTerminated && code === 0x07) || code === 0x9c) return index + 1;
+		if (code === 0x1b && line.charCodeAt(index + 1) === 0x5c) return index + 2;
+		index += 1;
+	}
+	return index;
+}
+
+function skipCsi(line: string, start: number): number {
+	let index = start;
+	while (index < line.length) {
+		if (isFinalByte(line.charCodeAt(index))) return index + 1;
+		index += 1;
+	}
+	return index;
+}
+
+/** Strip ECMA-48 terminal controls while retaining printable text, including OSC 8 link labels. */
+export function cleanTerminalLine(line: string): string {
+	let output = "";
+	let index = 0;
+	while (index < line.length) {
+		const code = line.charCodeAt(index);
+		if (code === 0x1b) {
+			const next = line.charCodeAt(index + 1);
+			if (next === 0x5b) index = skipCsi(line, index + 2);
+			else if (next === 0x5d || next === 0x50 || next === 0x58 || next === 0x5e || next === 0x5f) {
+				index = skipControlString(line, index + 2, next === 0x5d);
+			} else {
+				index += 1;
+				while (index < line.length && line.charCodeAt(index) >= 0x20 && line.charCodeAt(index) <= 0x2f) index += 1;
+				if (index < line.length) index += 1;
+			}
+			continue;
+		}
+		if (code === 0x9b) {
+			index = skipCsi(line, index + 1);
+			continue;
+		}
+		if (code === 0x90 || code === 0x98 || code === 0x9d || code === 0x9e || code === 0x9f) {
+			index = skipControlString(line, index + 1, code === 0x9d);
+			continue;
+		}
+		if (code === 0x09) output += "    ";
+		else if ((code >= 0x20 && code !== 0x7f && code < 0x80) || code >= 0xa0) output += line[index];
+		index += 1;
+	}
+	return output;
+}
+
+function joinedLength(lines: string[]): number {
+	return lines.reduce((length, line) => length + line.length, Math.max(0, lines.length - 1));
+}
+
+function shorterThan(replacement: string[], original: string[]): boolean {
+	return joinedLength(replacement) < joinedLength(original);
+}
+
+function progressSignature(line: string): string | undefined {
+	if (PNPM_PROGRESS.test(line)) {
+		return line.replace(/\d+/gu, "<count>").trim().toLowerCase();
+	}
+	if (!PROGRESS_TOKEN.test(line)) return undefined;
+	return line
+		.replace(/\[[#=*>.\- ]{3,}\]/gu, "<bar>")
+		.replace(/\d{1,3}(?:\.\d+)?%/gu, "<percent>")
+		.replace(/\b\d+\s*\/\s*\d+\b/gu, "<fraction>")
+		.trim()
+		.toLowerCase();
+}
+
+function compactPackageList(line: string): { lines: string[]; omitted: number } | undefined {
+	const match = PACKAGE_LIST.exec(line);
+	if (!match) return undefined;
+	const packages = match[2]!.split(/,\s*/u);
+	if (packages.length < 8) return undefined;
+	const omitted = packages.length - 5;
+	const replacement = [
+		`${match[1]}${packages.slice(0, 3).join(", ")}`,
+		`[... ${omitted} package entries omitted ...]`,
+		packages.slice(-2).join(", "),
+	];
+	return shorterThan(replacement, [line]) ? { lines: replacement, omitted } : undefined;
+}
+
+export function compactTerminalLines(lines: string[]): { lines: string[]; omittedLineCount: number } {
+	const cleaned = lines.map(cleanTerminalLine);
+	const output: string[] = [];
+	let omittedLineCount = 0;
+	let index = 0;
+
+	while (index < cleaned.length) {
+		const line = cleaned[index]!;
+		const inlinePackages = !IMPORTANT_LINE.test(line) ? compactPackageList(line) : undefined;
+		if (inlinePackages) {
+			output.push(...inlinePackages.lines);
+			omittedLineCount += inlinePackages.omitted;
+			index += 1;
+			continue;
+		}
+
+		let end = index + 1;
+		while (end < cleaned.length && cleaned[end] === line) end += 1;
+		const repeatedReplacement = [line, `[... ${end - index - 1} repeated ${end - index === 2 ? "line" : "lines"} omitted ...]`];
+		if (end - index > 1 && !IMPORTANT_LINE.test(line) && shorterThan(repeatedReplacement, cleaned.slice(index, end))) {
+			output.push(...repeatedReplacement);
+			omittedLineCount += end - index - 1;
+			index = end;
+			continue;
+		}
+
+		const signature = progressSignature(line);
+		if (signature && !IMPORTANT_LINE.test(line)) {
+			end = index + 1;
+			while (end < cleaned.length && progressSignature(cleaned[end]!) === signature && !IMPORTANT_LINE.test(cleaned[end]!)) end += 1;
+			const omitted = end - index - 1;
+			const replacement = [`[... ${omitted} progress updates omitted ...]`, cleaned[end - 1]!];
+			if (end - index >= 3 && shorterThan(replacement, cleaned.slice(index, end))) {
+				output.push(...replacement);
+				omittedLineCount += omitted;
+				index = end;
+				continue;
+			}
+		}
+
+		const hasPackageContext = index > 0 && PACKAGE_CONTEXT.test(cleaned[index - 1]!);
+		const isPackageEntry = (candidate: string) => TREE_PACKAGE_ENTRY.test(candidate)
+			|| SPEC_PACKAGE_ENTRY.test(candidate)
+			|| (hasPackageContext && PACKAGE_ENTRY.test(candidate.replace(/^\s*(?:[+~-]\s+|[├└]─+\s*)/u, "")));
+		if (isPackageEntry(line) && !IMPORTANT_LINE.test(line)) {
+			end = index + 1;
+			while (end < cleaned.length && isPackageEntry(cleaned[end]!) && !IMPORTANT_LINE.test(cleaned[end]!)) end += 1;
+			if (end - index >= 6) {
+				const omitted = end - index - 4;
+				const replacement = [
+					...cleaned.slice(index, index + 2),
+					`[... ${omitted} package entries omitted ...]`,
+					...cleaned.slice(end - 2, end),
+				];
+				if (shorterThan(replacement, cleaned.slice(index, end))) {
+					output.push(...replacement);
+					omittedLineCount += omitted;
+					index = end;
+					continue;
+				}
+			}
+		}
+
+		output.push(line);
+		index += 1;
+	}
+
+	return { lines: output, omittedLineCount };
+}
+
+export function renderObserverRead(result: ObserverReadResult, mode: ObserverReadMode = "compact"): RenderedObserverRead {
+	const compacted = mode === "compact"
+		? compactTerminalLines(result.lines)
+		: { lines: result.lines, omittedLineCount: 0 };
+	const counts = mode === "compact"
+		? `${result.lines.length}->${compacted.lines.length}`
+		: String(result.lines.length);
+	const status = [
+		"cmux observer",
+		`mode=${mode}`,
+		`cursor=${result.cursor}`,
+		`lines=${counts}`,
+		...(compacted.omittedLineCount > 0 ? [`omitted=${compacted.omittedLineCount}`] : []),
+		`more=${result.hasMore ? "yes" : "no"}`,
+		`ended=${result.ended ? "yes" : "no"}`,
+		`gap=${result.gap ? "yes" : "no"}`,
+	].join(" | ");
+	const metadata = [`[${status}]`, ...(result.gapReason ? [`[gap: ${cleanTerminalLine(result.gapReason)}]`] : [])];
+	const body = compacted.lines.length > 0 ? compacted.lines.join("\n") : "[no new output]";
+	return {
+		text: `${metadata.join("\n")}\n${body}`,
+		mode,
+		sourceLineCount: result.lines.length,
+		renderedLineCount: compacted.lines.length,
+		omittedLineCount: compacted.omittedLineCount,
+	};
 }
 
 export interface ObserverWaitResult {

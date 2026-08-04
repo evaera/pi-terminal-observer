@@ -7,7 +7,10 @@ import {
 	HARD_MAX_CHARS,
 	HARD_MAX_LINES,
 	ObserverManager,
+	renderObserverRead,
 	type ObserverFrom,
+	type ObserverReadMode,
+	type ObserverReadResult,
 	type Trigger,
 } from "./observer.ts";
 
@@ -22,6 +25,19 @@ function toolResult(value: unknown) {
 	return {
 		content: [{ type: "text" as const, text: JSON.stringify(value) }],
 		details: value,
+	};
+}
+
+export function readToolResult(result: ObserverReadResult, mode: ObserverReadMode = "compact") {
+	const rendered = renderObserverRead(result, mode);
+	return {
+		content: [{ type: "text" as const, text: rendered.text }],
+		details: {
+			...result,
+			mode: rendered.mode,
+			renderedLineCount: rendered.renderedLineCount,
+			omittedLineCount: rendered.omittedLineCount,
+		},
 	};
 }
 
@@ -58,14 +74,16 @@ export default function cmuxObserverExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "cmux_observer_read",
 		label: "Read cmux observer",
-		description: `Read only new normalized completed lines from an observer. The cursor is stored outside model context. Results are capped at ${HARD_MAX_LINES} lines and ${HARD_MAX_CHARS} characters; defaults are ${DEFAULT_MAX_LINES} lines and ${DEFAULT_MAX_CHARS} characters. gap=true means output may be missing.`,
+		description: `Read only new normalized completed lines from an observer as plain text with a concise status header. mode=compact (default) removes terminal control noise and conservatively shortens repeated, same-signature progress, and large package-list output. mode=raw preserves stored line text exactly. Reads consume the cursor, so select raw on the read where exact output is needed. The cursor is stored outside model context. Results are capped at ${HARD_MAX_LINES} lines and ${HARD_MAX_CHARS} characters; defaults are ${DEFAULT_MAX_LINES} lines and ${DEFAULT_MAX_CHARS} characters. gap=yes means output may be missing.`,
 		parameters: Type.Object({
 			handle: Type.String({ minLength: 1 }),
+			mode: Type.Optional(StringEnum(["compact", "raw"] as const, { description: "Output rendering mode (default: compact); choose raw on this consuming read to preserve exact stored line text" })),
 			maxLines: Type.Optional(Type.Integer({ minimum: 1, maximum: HARD_MAX_LINES, description: `Default ${DEFAULT_MAX_LINES}` })),
 			maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: HARD_MAX_CHARS, description: `Default ${DEFAULT_MAX_CHARS}` })),
 		}),
 		async execute(_toolCallId, params) {
-			return toolResult(await requireManager().read(params.handle, params.maxLines, params.maxChars));
+			const result = await requireManager().read(params.handle, params.maxLines, params.maxChars);
+			return readToolResult(result, (params.mode ?? "compact") as ObserverReadMode);
 		},
 	});
 

@@ -39,16 +39,28 @@ Call `cmux_observer_start`. `from` defaults to `now`, which suppresses existing 
 ### Read incremental lines
 
 ```json
-{"handle":"...","maxLines":100,"maxChars":8000}
+{"handle":"...","mode":"compact","maxLines":50,"maxChars":4000}
 ```
 
-Call `cmux_observer_read`. The observer owns and persists the read cursor outside model context. A read advances it and returns:
+Call `cmux_observer_read`. The observer owns and persists the read cursor outside model context. A read advances it and returns terminal lines as plain text under a concise status header:
+
+```text
+[cmux observer | mode=compact | cursor=24 | lines=8->4 | omitted=4 | more=no | ended=no | gap=no]
+Building package
+[... 3 progress updates omitted ...]
+Build complete
+ready
+```
+
+`mode` defaults to `compact`. Compact mode strips ANSI and terminal control noise, conservatively collapses consecutive duplicate and same-signature progress lines, and shortens large package-install listings. Explicit omission markers and counts describe collapsed lines or entries, while warnings, errors, beginning and ending summaries, and useful tail output remain visible.
+
+Use `mode: "raw"` when exact output matters. Raw mode does not clean or collapse stored line text. Its only addition is the plain-text status envelope. Reads consume the cursor, so select raw on that read before compact rendering discards presentation detail from model-facing output:
 
 ```json
-{"lines":[],"cursor":0,"hasMore":false,"ended":false,"gap":false}
+{"handle":"...","mode":"raw"}
 ```
 
-Hard limits are 500 lines and 20,000 observed characters per call.
+Structured cursor, gap, lifecycle, original line, and compaction-count data remain available in tool result details for clients that inspect them. Default limits are 50 lines and 4,000 observed characters. Hard limits are 500 lines and 20,000 observed characters per call.
 
 ### Wait for a trigger
 
@@ -81,7 +93,7 @@ Call `cmux_observer_stop`. Buffered lines remain readable until Pi session shutd
 3. Normalize CR/LF and delay the mutable final rendered row until it becomes a completed row.
 4. Diff each snapshot against the previous snapshot, including suffix/prefix overlap for scrollback rollover.
 5. Append only new lines to a bounded JSONL spool.
-6. Return observed text only from an explicit read or a matching wait.
+6. Return observed text only from an explicit read or a matching wait. Read rendering happens after spooling and cursor advancement, so compact mode does not affect stored data, diffing, triggers, or wait behavior.
 
 This is screen-diff observation, not raw PTY mirroring. It can miss output that appears and disappears between polls. Terminal rewrites or clears can also make continuity ambiguous. The API returns `gap: true` instead of claiming a lossless stream.
 

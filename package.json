@@ -22,6 +22,7 @@
   "files": [
     "index.ts",
     "observer.ts",
+    "semantic.ts",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

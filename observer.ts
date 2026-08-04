@@ -52,6 +52,16 @@ export interface ObserverReadResult {
 	gapReason?: string;
 }
 
+/** A bounded, non-consuming view used by semantic queries and independent watches. */
+export interface ObserverEvidenceResult extends ObserverReadResult {
+	startCursor: number;
+	/** A stable mutable final row, exposed only to semantic operations and never spooled/read. */
+	liveLine?: string;
+	liveRevision: number;
+}
+
+export interface ObserverPosition { cursor: number; liveRevision: number }
+
 export type ObserverReadMode = "compact" | "raw";
 
 export interface RenderedObserverRead {
@@ -309,13 +319,17 @@ async function atomicPrivateWrite(path: string, content: string): Promise<void> 
 	await chmod(path, 0o600);
 }
 
-export function normalizeSnapshot(text: string): string[] {
+export function normalizeSnapshotDetailed(text: string): { completed: string[]; live?: string } {
 	const lines = text.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
 	while (lines.length > 0 && lines.at(-1) === "") lines.pop();
-	if (lines.length === 0) return [];
-	// The last rendered row may still be changing (prompt, progress bar, partial line).
-	// Delay it until a later row appears so model-facing output favors completed lines.
-	return lines.slice(0, -1).map((line) => line.replace(/[\t ]+$/u, ""));
+	if (lines.length === 0) return { completed: [] };
+	const normalized = lines.map((line) => line.replace(/[\t ]+$/u, ""));
+	return { completed: normalized.slice(0, -1), live: normalized.at(-1) };
+}
+
+export function normalizeSnapshot(text: string): string[] {
+	// Preserve the original completed-line contract. Semantic consumers separately see a stable live row.
+	return normalizeSnapshotDetailed(text).completed;
 }
 
 export function diffSnapshots(previous: string[], current: string[]): { lines: string[]; gap: boolean } {
@@ -349,10 +363,17 @@ class Observer {
 	private state: PersistedState;
 	private records: RecordLine[] = [];
 	private previous: string[] = [];
+	private liveLine?: string;
+	private liveRevision = 0;
+	private liveChangedAt = 0;
 	private timer?: NodeJS.Timeout;
 	private pollTask?: Promise<void>;
 	private consecutiveErrors = 0;
-	private pendingGapReason?: string;
+	private pendingGapReasons: string[] = [];
+
+	private get pendingGapReason(): string | undefined {
+		return this.pendingGapReasons.length > 0 ? this.pendingGapReasons.join("; ") : undefined;
+	}
 	private revision = 0;
 	private waiters = new Set<() => void>();
 	private mutation: Promise<unknown> = Promise.resolve();
@@ -402,9 +423,10 @@ class Observer {
 	async start(from: ObserverFrom): Promise<void> {
 		await mkdir(this.dir, { recursive: true, mode: 0o700 });
 		await chmod(this.dir, 0o700);
-		const snapshot = normalizeSnapshot(await this.readScreen(this.surface, this.workspace));
-		this.previous = snapshot;
-		if (from === "screen") await this.appendUnlocked(snapshot);
+		const snapshot = normalizeSnapshotDetailed(await this.readScreen(this.surface, this.workspace));
+		this.previous = snapshot.completed;
+		this.updateLive(snapshot.live);
+		if (from === "screen") await this.appendUnlocked(snapshot.completed);
 		await this.persist();
 		this.timer = setInterval(() => this.schedulePoll(), this.pollMs);
 		this.timer.unref();
@@ -430,14 +452,22 @@ class Observer {
 		}).catch(() => undefined);
 	}
 
+	private updateLive(line?: string): void {
+		if (line === this.liveLine) return;
+		this.liveLine = line;
+		this.liveRevision += 1;
+		this.liveChangedAt = Date.now();
+	}
+
 	private async poll(): Promise<void> {
 		try {
-			const current = normalizeSnapshot(await this.readScreen(this.surface, this.workspace));
+			const current = normalizeSnapshotDetailed(await this.readScreen(this.surface, this.workspace));
 			this.consecutiveErrors = 0;
 			await this.withLock(async () => {
 				if (this.state.ended) return;
-				const delta = diffSnapshots(this.previous, current);
-				this.previous = current;
+				const delta = diffSnapshots(this.previous, current.completed);
+				this.previous = current.completed;
+				this.updateLive(current.live);
 				if (delta.gap) this.markGap("screen snapshots no longer overlap; output may have been dropped or rewritten");
 				if (delta.lines.length > 0) await this.appendUnlocked(delta.lines);
 				else if (Date.now() - this.state.updatedAt >= 60_000) await this.persist();
@@ -459,7 +489,11 @@ class Observer {
 	}
 
 	private markGap(reason: string): void {
-		this.pendingGapReason = reason;
+		if (reason.startsWith("bounded spool dropped output through cursor ")) {
+			this.pendingGapReasons = this.pendingGapReasons.filter((pending) => !pending.startsWith("bounded spool dropped output through cursor "));
+		}
+		if (!this.pendingGapReasons.includes(reason)) this.pendingGapReasons.push(reason);
+		while (this.pendingGapReasons.length > 1 && this.pendingGapReasons.join("; ").length > 1_000) this.pendingGapReasons.shift();
 	}
 
 	private async appendUnlocked(lines: string[]): Promise<void> {
@@ -490,6 +524,89 @@ class Observer {
 		this.waiters.clear();
 	}
 
+	async evidence(after: number | undefined, maxLines: number, maxChars: number, afterLiveRevision?: number, recordMaxChars = maxChars): Promise<ObserverEvidenceResult> {
+		return this.withLock(async () => {
+			const requested = after ?? Math.max(this.state.firstSeq - 1, this.state.nextSeq - 1 - maxLines);
+			const startCursor = Math.max(requested, this.state.firstSeq - 1);
+			let gap = requested < this.state.firstSeq - 1 || Boolean(this.pendingGapReason);
+			const gapReasons = [
+				...(requested < this.state.firstSeq - 1 ? [`bounded spool no longer contains output through cursor ${this.state.firstSeq - 1}`] : []),
+				...(this.pendingGapReason ? [this.pendingGapReason] : []),
+			];
+			const lines: string[] = [];
+			let chars = 0;
+			let cursor = startCursor;
+			for (const record of this.records) {
+				if (record.seq <= startCursor) continue;
+				if (lines.length >= maxLines || chars >= maxChars) break;
+				const remaining = maxChars - chars;
+				if (record.text.length > recordMaxChars) {
+					lines.push(record.text.slice(0, remaining));
+					gap = true;
+					gapReasons.push("semantic evidence blocked by a line exceeding maxChars; cursor was not advanced past it");
+					break;
+				}
+				if (record.text.length > remaining) break;
+				lines.push(record.text);
+				chars += record.text.length;
+				cursor = record.seq;
+			}
+			const liveEligible = this.liveLine !== undefined
+				&& Date.now() - this.liveChangedAt >= 500
+				&& (afterLiveRevision === undefined || this.liveRevision > afterLiveRevision);
+			return {
+				lines,
+				startCursor,
+				liveLine: liveEligible ? this.liveLine : undefined,
+				liveRevision: liveEligible ? this.liveRevision : (afterLiveRevision ?? this.liveRevision),
+				cursor,
+				hasMore: this.records.some((record) => record.seq > cursor),
+				ended: this.state.ended,
+				gap,
+				gapReason: gapReasons.length > 0 ? gapReasons.join("; ") : undefined,
+			};
+		});
+	}
+
+	async recentEvidence(maxLines: number, maxChars: number): Promise<ObserverEvidenceResult> {
+		return this.withLock(async () => {
+			const selected: RecordLine[] = [];
+			let chars = 0;
+			let gap = Boolean(this.pendingGapReason);
+			const reasons = this.pendingGapReason ? [this.pendingGapReason] : [];
+			for (let index = this.records.length - 1; index >= 0 && selected.length < maxLines; index -= 1) {
+				const record = this.records[index]!;
+				if (record.text.length > maxChars) {
+					if (selected.length === 0) selected.push({ ...record, text: record.text.slice(-maxChars) });
+					gap = true;
+					reasons.push("newest semantic evidence line was truncated to maxChars");
+					break;
+				}
+				if (chars + record.text.length > maxChars) break;
+				selected.push(record);
+				chars += record.text.length;
+			}
+			selected.reverse();
+			const liveEligible = this.liveLine !== undefined && Date.now() - this.liveChangedAt >= 500;
+			return {
+				lines: selected.map((record) => record.text),
+				startCursor: selected[0] ? selected[0].seq - 1 : this.state.nextSeq - 1,
+				cursor: selected.at(-1)?.seq ?? this.state.nextSeq - 1,
+				// Recent evidence is anchored at the newest record, so forward pagination has no remainder.
+				hasMore: this.records.some((record) => record.seq > (selected.at(-1)?.seq ?? this.state.nextSeq - 1)),
+				ended: this.state.ended,
+				gap,
+				gapReason: reasons.length > 0 ? reasons.join("; ") : undefined,
+				liveLine: liveEligible ? this.liveLine : undefined,
+				liveRevision: this.liveRevision,
+			};
+		});
+	}
+
+	position(): ObserverPosition {
+		return { cursor: this.state.nextSeq - 1, liveRevision: this.liveRevision };
+	}
+
 	async read(maxLines: number, maxChars: number): Promise<ObserverReadResult> {
 		return this.withLock(async () => {
 			let gap = false;
@@ -498,7 +615,7 @@ class Observer {
 				gap = true;
 				gapReason = this.pendingGapReason ?? `output before cursor ${this.state.firstSeq - 1} is unavailable`;
 				this.state.readCursor = Math.max(this.state.readCursor, this.state.firstSeq - 1);
-				this.pendingGapReason = undefined;
+				this.pendingGapReasons = [];
 			}
 
 			const available = this.records.filter((record) => record.seq > this.state.readCursor);
@@ -734,6 +851,27 @@ export class ObserverManager {
 			Math.max(1, Math.min(HARD_MAX_LINES, maxLines)),
 			Math.max(1, Math.min(HARD_MAX_CHARS, maxChars)),
 		);
+	}
+
+	async recentEvidence(handle: string, maxLines = DEFAULT_MAX_LINES, maxChars = DEFAULT_MAX_CHARS): Promise<ObserverEvidenceResult> {
+		return this.require(handle).recentEvidence(
+			Math.max(1, Math.min(HARD_MAX_LINES, maxLines)),
+			Math.max(1, Math.min(HARD_MAX_CHARS, maxChars)),
+		);
+	}
+
+	async evidence(handle: string, after?: number, maxLines = DEFAULT_MAX_LINES, maxChars = DEFAULT_MAX_CHARS, afterLiveRevision?: number, recordMaxChars = maxChars): Promise<ObserverEvidenceResult> {
+		return this.require(handle).evidence(
+			after,
+			Math.max(1, Math.min(HARD_MAX_LINES, maxLines)),
+			Math.max(1, Math.min(HARD_MAX_CHARS, maxChars)),
+			afterLiveRevision,
+			Math.max(1, Math.min(HARD_MAX_CHARS, recordMaxChars)),
+		);
+	}
+
+	position(handle: string): ObserverPosition {
+		return this.require(handle).position();
 	}
 
 	async wait(handle: string, triggers: Trigger[], timeoutMs: number, signal?: AbortSignal): Promise<ObserverWaitResult> {

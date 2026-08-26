@@ -1,14 +1,23 @@
-# pi-cmux-observer
+# pi-terminal-observer
 
-A context-efficient [Pi](https://github.com/earendil-works/pi) extension for incrementally observing existing cmux terminal surfaces.
+A terminal surface observer for [Pi](https://github.com/earendil-works/pi). It lets the agent and human share existing interactive terminal surfaces without repeatedly copying full screen snapshots into model context.
 
-`pi-cmux-observer` keeps full terminal snapshots outside model context. The main model receives terminal content only when it explicitly reads new lines, waits for a matching trigger, asks a bounded question, or receives a grounded semantic watch notification.
+`pi-terminal-observer` is passive. It does not create terminals, launch or control processes inside them, send input, change focus, or take ownership of a surface. The main model receives terminal content only when it explicitly reads new lines, waits for a matching trigger, asks a bounded question, or receives a grounded semantic watch notification.
 
 ## Requirements
 
 - Pi 0.81.1 or newer. Direct model calls use the `@earendil-works/pi-ai/compat` API verified by this package's type check; treat a future compat removal or signature change as a build-time upgrade tripwire.
 - Node.js 22.19.0 or newer
-- cmux with CLI/socket access available to the Pi process
+- cmux with CLI/socket access, or the Paseo CLI, available to the Pi process
+
+A nonblank `PASEO_AGENT_ID` selects Paseo even if inherited cmux identity variables are also present.
+
+## Supported terminal surfaces
+
+- [x] cmux terminal surfaces, captured through `cmux read-screen`
+- [x] Paseo managed terminals, captured through `${PASEO_CLI:-paseo} terminal capture`
+
+The `surface` argument is a cmux surface ref or a Paseo terminal ID. `workspace` is cmux-only and is ignored under Paseo.
 
 ## Installation
 
@@ -21,7 +30,7 @@ pi install git:github.com/evaera/pi-cmux-observer
 For local development, install the project directory instead:
 
 ```sh
-pi install /path/to/pi-cmux-observer
+pi install /path/to/pi-terminal-observer
 ```
 
 Run `/reload` after changing an existing installation. The extension registers brief usage guidance and exposes complete tool descriptions and schemas through Pi's custom-tool mechanism.
@@ -30,11 +39,19 @@ Run `/reload` after changing an existing installation. The extension registers b
 
 ### Start observing
 
+cmux:
+
 ```json
 {"surface":"surface:24","workspace":"workspace:9","from":"now"}
 ```
 
-Call `cmux_observer_start`. `from` defaults to `now`, which suppresses existing screen contents. Use `screen` to include the current normalized screen and scrollback. Repeated starts for the same surface and workspace reuse the active handle.
+Paseo:
+
+```json
+{"surface":"<terminal-id>","from":"now"}
+```
+
+Call `terminal_observer_start`. `from` defaults to `now`, which suppresses existing screen contents. Use `screen` to include the current normalized screen and scrollback. Repeated starts for the same target reuse the active handle.
 
 ### Read incremental lines
 
@@ -42,10 +59,10 @@ Call `cmux_observer_start`. `from` defaults to `now`, which suppresses existing 
 {"handle":"...","mode":"compact","maxLines":50,"maxChars":4000}
 ```
 
-Call `cmux_observer_read`. The observer owns and persists the read cursor outside model context. A read advances it and returns terminal lines as plain text under a concise status header:
+Call `terminal_observer_read`. The observer owns and persists the read cursor outside model context. A read advances it and returns terminal lines as plain text under a concise status header:
 
 ```text
-[cmux observer | mode=compact | cursor=24 | lines=8->4 | omitted=4 | more=no | ended=no | gap=no]
+[terminal observer | mode=compact | cursor=24 | lines=8->4 | omitted=4 | more=no | ended=no | gap=no]
 Building package
 [... 3 progress updates omitted ...]
 Build complete
@@ -68,7 +85,7 @@ Structured cursor, gap, lifecycle, original line, and compaction-count data rema
 {"handle":"...","question":"Did the build finish successfully?"}
 ```
 
-Call `cmux_observer_ask` for a concise answer based on the newest evidence gathered backwards within at most 80 recent compact lines and 8,000 characters. It makes a direct, tool-free Luna request at low thinking and returns only the answer, up to three short exact evidence quotes, status, model, usage, and gap metadata. It does not consume the ordinary read cursor. Optional `maxLines` and `maxChars` can lower the evidence bounds. If Luna is unavailable, ask returns a clearly labeled `model-unavailable` result with up to three deterministic compact evidence lines and does not invent an answer.
+Call `terminal_observer_ask` for a concise answer based on the newest evidence gathered backwards within at most 80 recent compact lines and 8,000 characters. It makes a direct, tool-free Luna request at low thinking and returns only the answer, up to three short exact evidence quotes, status, model, usage, and gap metadata. It does not consume the ordinary read cursor. Optional `maxLines` and `maxChars` can lower the evidence bounds. If Luna is unavailable, ask returns a clearly labeled `model-unavailable` result with up to three deterministic compact evidence lines and does not invent an answer.
 
 Luna is discovered from Pi's authenticated runtime model registry using an exact allowlist, in priority order: `cloudflare-ai-gateway/gpt-5.6-luna`, `openai/gpt-5.6-luna`, then `azure-openai-responses/gpt-5.6-luna`. Substring matches and other providers are never selected. If no allowlisted authenticated model exists, ask returns its labeled deterministic evidence fallback while watches fail closed.
 
@@ -78,11 +95,11 @@ Luna is discovered from Pi's authenticated runtime model registry using an exact
 {"action":"start","handle":"...","condition":"the build has completed successfully","timeoutMs":1800000}
 ```
 
-Call `cmux_observer_watch` with `action: "start"` to create a background semantic watch. Start returns its ID immediately. Each watch begins at the latest output and owns an independent cursor, so it does not consume ordinary reads or interfere with sibling watches. Meaningful new output is processed sequentially in bounded front-to-back chunks and debounced for about 750 ms before evaluation. A finite burst gets up to three consecutive minimum-backoff drain chunks, then adaptive doubling resumes even if a producer sustains the backlog. The fast-drain window resets after the backlog clears. No model request is made while there is no new output. Each evaluation retains at most 12 recently evaluated cleaned completed lines and 1,200 characters. Mutable live rows are never retained because they may be overwritten. The completed-line overlap is reconsidered only alongside later completed output or a later stable live-row revision, preventing one low-confidence decision from permanently consuming a possible match without causing idle model calls. New evidence keeps priority within the unchanged 80-line and 8,000-character prompt bounds.
+Call `terminal_observer_watch` with `action: "start"` to create a background semantic watch. Start returns its ID immediately. Each watch begins at the latest output and owns an independent cursor, so it does not consume ordinary reads or interfere with sibling watches. Meaningful new output is processed sequentially in bounded front-to-back chunks and debounced for about 750 ms before evaluation. A finite burst gets up to three consecutive minimum-backoff drain chunks, then adaptive doubling resumes even if a producer sustains the backlog. The fast-drain window resets after the backlog clears. No model request is made while there is no new output. Each evaluation retains at most 12 recently evaluated cleaned completed lines and 1,200 characters. Mutable live rows are never retained because they may be overwritten. The completed-line overlap is reconsidered only alongside later completed output or a later stable live-row revision, preventing one low-confidence decision from permanently consuming a possible match without causing idle model calls. New evidence keeps priority within the unchanged 80-line and 8,000-character prompt bounds.
 
 The decision prompt requires line-by-line evaluation: a standalone output line can prove the condition even when a typed shell command echo appears in the same chunk. Evidence must quote the exact complete satisfying output line, not command text or a command substring. Grounding deliberately compares cleaned display lines after trimming surrounding whitespace, so an indented output quote can match its displayed line while a substring embedded in a command cannot. The prompt identifies the sole current live row by index; its reserved `[stable live row]` marker cannot be fabricated by completed terminal output. Confirmed evidence is stored as normalized cleaned display text, without observer markers or terminal controls. A watch creates a candidate only when strict JSON reports a high-confidence match and this normalized exact-line grounding succeeds. A distinct stricter verifier must confirm it against the same stable evidence. Each watch line is cleaned independently while retaining one-to-one cursor mapping, then JSON-encoded as untrusted data; nested requests have no tools. One malformed structured response is retried once within the same budgets and never fires. Repeated schema drift remains an active fail-closed non-match with bounded stage-specific diagnostics rather than ending the watch immediately. A 500,000-token per-watch cap, 2,000,000-token shared session cap, wall-clock timeout, and shared request-rate gate let the default 30-minute adaptive cadence run plausibly while remaining hard-bounded. Unavailable, aborted, or over-budget calls end with fixed public summaries.
 
-Use `{"action":"list"}` to inspect bounded untrusted evidence, gap state, evaluation/token totals, statuses, and the last decision's bounded confidence, reason code, and short summary. The default returns all active watches plus five recent completed watches; `watchId`, `status`, and `limit` (maximum 25) filter it. Conditions are truncated to 120 characters, evidence fields are shortened, and serialized entries have a 20,000-byte hard bound. Use `{"action":"cancel","watchId":"..."}` to cancel. At most 16 watches may be active per session and 4 per handle; only the newest 100 completed watches are retained. Timeout defaults to 30 minutes and is capped at 24 hours. Fixed terminal-free follow-up messages wake the main agent for `matched`, `timed-out`, `ended`, and `error`, with the outcome distinguished safely. Reload/shutdown cancels timers and in-flight calls without a later wake. Watches do not persist across process restarts. Background usage is appended durably as excluded `cmux-observer-state` entries after each completion, but Pi does not add it to foreground tool-call usage totals.
+Use `{"action":"list"}` to inspect bounded untrusted evidence, gap state, evaluation/token totals, statuses, and the last decision's bounded confidence, reason code, and short summary. The default returns all active watches plus five recent completed watches; `watchId`, `status`, and `limit` (maximum 25) filter it. Conditions are truncated to 120 characters, evidence fields are shortened, and serialized entries have a 20,000-byte hard bound. Use `{"action":"cancel","watchId":"..."}` to cancel. At most 16 watches may be active per session and 4 per handle; only the newest 100 completed watches are retained. Timeout defaults to 30 minutes and is capped at 24 hours. Fixed terminal-free follow-up messages wake the main agent for `matched`, `timed-out`, `ended`, and `error`, with the outcome distinguished safely. Reload/shutdown cancels timers and in-flight calls without a later wake. Watches do not persist across process restarts. Background usage is appended durably as excluded `terminal-observer-state` entries after each completion, but Pi does not add it to foreground tool-call usage totals.
 
 ### Wait for a trigger
 
@@ -94,7 +111,7 @@ Use `{"action":"list"}` to inspect bounded untrusted evidence, gap state, evalua
 }
 ```
 
-Call `cmux_observer_wait`. Regex triggers use JavaScript regular expression syntax. Wait returns only a matching line or timeout status. It does not consume the read cursor or inject unrelated terminal output.
+Call `terminal_observer_wait`. Regex triggers use JavaScript regular expression syntax. Wait returns only a matching line or timeout status. It does not consume the read cursor or inject unrelated terminal output.
 
 Preferred hierarchy: use **ask** to understand current status, **watch** for future semantic conditions, **wait** for exact literal or regex conditions, and **read** for broader evidence or exact/raw output.
 
@@ -104,15 +121,15 @@ Preferred hierarchy: use **ask** to understand current status, **watch** for fut
 {"handle":"..."}
 ```
 
-Call `cmux_observer_stop`. Buffered lines remain readable until Pi session shutdown.
+Call `terminal_observer_stop`. Buffered lines remain readable until Pi session shutdown.
 
-`/cmux-observers` lists handles without sending terminal content to the model.
+`/terminal-observers` lists handles without sending terminal content to the model.
 
 ## Architecture
 
-`cmux pipe-pane` returns a finite snapshot rather than a stream of future terminal output. To observe new output, the extension:
+Both supported capture commands return finite snapshots rather than streams of future terminal output. To observe new output, the extension:
 
-1. Poll `cmux read-screen --surface ... --scrollback` every 250 ms.
+1. Poll `cmux read-screen --surface ... --scrollback`, or Paseo `terminal capture ... --scrollback --json`, every 250 ms.
 2. Keep snapshots inside the extension process, never in Pi model context.
 3. Normalize CR/LF and keep the mutable final rendered row separate with revision and stability tracking. It remains excluded from ordinary reads but lets semantic operations notice stable prompt-only transitions.
 4. Diff each snapshot against the previous snapshot, including suffix/prefix overlap for scrollback rollover.
@@ -125,7 +142,7 @@ This is screen-diff observation, not raw PTY mirroring. It can miss output that 
 ## Storage and lifecycle
 
 - Handles are scoped to the current Pi session and use random 128-bit identifiers.
-- Runtime files live under `~/.local/state/pi/cmux-observer/<session>/<handle>/`.
+- Runtime files live under `~/.local/state/pi/terminal-observer/<session>/<handle>/`.
 - Directories are mode `0700`. `state.json` and `events.jsonl` are mode `0600`.
 - Each handle has a 1 MiB bounded spool. High-volume output can outrun it before a watch drains every chunk; old records are removed and reads or watches report a gap.
 - A single completed terminal line over the watch's 8,000-character evidence limit cannot be advanced safely, so that watch fails closed with a fixed error wake.
@@ -138,7 +155,7 @@ This is screen-diff observation, not raw PTY mirroring. It can miss output that 
 
 ## Safety
 
-The observer does not focus surfaces, send terminal input, or mutate cmux state. It invokes only `cmux read-screen` after startup. Runtime data is local, private, bounded, and removed by TTL. Terminal content is JSON-encoded as untrusted evidence in tool-free nested model requests. Watch decisions require valid structured output, high confidence, and a literal quote grounded in the supplied lines.
+The observer does not focus targets, send terminal input, or mutate terminal state. It invokes only cmux `read-screen` or Paseo `terminal capture` after startup. Runtime data is local, private, bounded, and removed by TTL. Terminal content is JSON-encoded as untrusted evidence in tool-free nested model requests. Watch decisions require valid structured output, high confidence, and a literal quote grounded in the supplied lines.
 
 ## Development
 
@@ -152,7 +169,7 @@ npm pack --dry-run
 For a live loading check:
 
 ```sh
-pi -e /path/to/pi-cmux-observer --offline --list-models
+pi -e /path/to/pi-terminal-observer --offline --list-models
 ```
 
 ## License

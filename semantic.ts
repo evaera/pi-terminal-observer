@@ -206,7 +206,7 @@ export class SemanticWatchManager {
 			liveRevision: position.liveRevision, controller: new AbortController(), evaluations: 0, usageTokens: 0, gap: false,
 			backoffMs: this.options.pollMs ?? WATCH_POLL_MS, fastDrainChunks: 0, overlapLines: [] };
 		this.watches.set(watch.id, watch);
-		watch.expiryTimer = setTimeout(() => this.finish(watch, "timed-out", `cmux observer watch ${watch.id} timed out.`, true), boundedTimeout);
+		watch.expiryTimer = setTimeout(() => this.finish(watch, "timed-out", `terminal observer watch ${watch.id} timed out.`, true), boundedTimeout);
 		watch.expiryTimer.unref();
 		this.schedule(watch, watch.backoffMs);
 		return this.publicInfo(watch);
@@ -362,7 +362,7 @@ export class SemanticWatchManager {
 	private async tick(watch: Watch): Promise<void> {
 		if (this.stopped || watch.status !== "active") return;
 		if (this.now() >= watch.expiresAt) {
-			this.finish(watch, "timed-out", `cmux observer watch ${watch.id} timed out.`, true);
+			this.finish(watch, "timed-out", `terminal observer watch ${watch.id} timed out.`, true);
 			return;
 		}
 		try {
@@ -371,7 +371,7 @@ export class SemanticWatchManager {
 			if (evidence.gapReason?.includes("blocked by a line exceeding")) throw new Error("terminal evidence exceeded the per-call character limit");
 			if (evidence.lines.length === 0 && !evidence.liveLine) {
 				watch.fastDrainChunks = 0;
-				if (evidence.ended) this.finish(watch, "ended", `cmux observer watch ${watch.id} ended before matching.`, true);
+				if (evidence.ended) this.finish(watch, "ended", `terminal observer watch ${watch.id} ended before matching.`, true);
 				else this.schedule(watch, watch.backoffMs);
 				return;
 			}
@@ -457,7 +457,7 @@ export class SemanticWatchManager {
 				if (confirmationReason === "confirmed") {
 					watch.evidence = this.normalizedDisplayLine(rawConfirmedQuote).slice(0, 500);
 					watch.summary = this.cleanSummary(result.summary, 500);
-					const message = `cmux observer watch ${watch.id} matched.`;
+					const message = `terminal observer watch ${watch.id} matched.`;
 					this.finish(watch, "matched", message, false);
 					if (!this.stopped) this.options.onMatch(message, this.publicInfo(watch));
 					return;
@@ -479,7 +479,7 @@ export class SemanticWatchManager {
 			watch.summary = fixedFailureSummary(reason);
 			watch.lastDecisionReason = "evaluation-error";
 			watch.lastDecisionSummary = watch.summary.slice(0, 160);
-			this.finish(watch, "error", `cmux observer watch ${watch.id} failed.`, true);
+			this.finish(watch, "error", `terminal observer watch ${watch.id} failed.`, true);
 		}
 	}
 }

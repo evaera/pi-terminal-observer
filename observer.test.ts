@@ -3,7 +3,7 @@ import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createExtensionWatchManager, readToolResult, selectLunaModel } from "./index.ts";
+import terminalObserverExtension, { createExtensionWatchManager, readToolResult, selectLunaModel } from "./index.ts";
 import { askObserver, MAX_ACTIVE_WATCHES, MAX_ACTIVE_WATCHES_PER_HANDLE, MAX_WATCH_TOKENS, nextWatchBackoff, SemanticWatchManager, type SemanticComplete } from "./semantic.ts";
 import {
 	cleanTerminalLine,
@@ -12,9 +12,14 @@ import {
 	DEFAULT_MAX_LINES,
 	diffSnapshots,
 	normalizeSnapshot,
+	createPaseoReadScreen,
+	createRuntimeReadScreen,
 	ObserverManager,
 	renderObserverRead,
 } from "./observer.ts";
+
+// The test runner may itself be hosted by Paseo. Individual compatibility tests opt in explicitly.
+delete process.env.PASEO_AGENT_ID;
 
 async function eventually(check: () => Promise<boolean> | boolean, timeoutMs = 1_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -30,6 +35,105 @@ function successfulWatchDecision(prompt: string, evidence: string, summary: stri
 		? JSON.stringify({ confirmed: true, confidence: "high", evidence })
 		: JSON.stringify({ matched: true, confidence: "high", evidence, summary });
 }
+
+test("Paseo CLI backend uses exact bounded capture arguments and parses ANSI lines", async () => {
+	const calls: Array<{ file: string; args: string[]; options: unknown }> = [];
+	const readScreen = createPaseoReadScreen("mock-paseo", async (file, args, options) => {
+		calls.push({ file, args, options });
+		return { stdout: JSON.stringify({ terminalId: "terminal:test", lines: ["\u001b[32mready\u001b[0m", "prompt"], totalLines: 2 }) };
+	});
+	assert.equal(await readScreen("terminal:test", "cmux-workspace-is-ignored"), "\u001b[32mready\u001b[0m\nprompt");
+	assert.deepEqual(calls, [{
+		file: "mock-paseo",
+		args: ["terminal", "capture", "--scrollback", "--json", "--", "terminal:test"],
+		options: { encoding: "utf8", timeout: 3_000, maxBuffer: 8 * 1024 * 1024 },
+	}]);
+});
+
+test("Paseo CLI backend rejects malformed output without exposing output or environment", async () => {
+	const secret = "SECRET_TERMINAL_OUTPUT";
+	const malformed = [
+		"not json",
+		JSON.stringify({ terminalId: "terminal:test", lines: ["ok", 1], totalLines: 2 }),
+		JSON.stringify({ terminalId: "terminal:test", lines: ["ok"], totalLines: "1" }),
+	];
+	for (const stdout of malformed) {
+		const readScreen = createPaseoReadScreen("mock-paseo", async () => ({ stdout: `${stdout}${stdout === "not json" ? secret : ""}` }));
+		await assert.rejects(readScreen("terminal:test"), (error: unknown) => {
+			const message = error instanceof Error ? error.message : String(error);
+			assert.equal(message, "Paseo terminal capture returned invalid JSON");
+			assert.equal(message.includes(secret), false);
+			return true;
+		});
+	}
+	const failed = createPaseoReadScreen("mock-paseo", async () => { throw new Error(secret); });
+	await assert.rejects(failed("terminal:test"), { message: "Paseo terminal capture failed" });
+});
+
+test("Paseo backend drives incremental observer behavior and never executes cmux", async () => {
+	const baseDir = await mkdtemp(join(tmpdir(), "terminal-observer-paseo-"));
+	let snapshot = { terminalId: "terminal:test", lines: ["existing", "prompt"], totalLines: 2 };
+	const executables: string[] = [];
+	const readScreen = createPaseoReadScreen("mock-paseo", async (file) => {
+		executables.push(file);
+		return { stdout: JSON.stringify(snapshot) };
+	});
+	const manager = new ObserverManager({ sessionId: "paseo-session", baseDir, pollMs: 5, readScreen });
+	await manager.initialize();
+	const { handle } = await manager.start("terminal:test", "now", "ignored-workspace");
+	snapshot = { terminalId: "terminal:test", lines: ["existing", "\u001b[31mfailed\u001b[0m", "prompt"], totalLines: 3 };
+	await eventually(async () => (await manager.read(handle)).lines.length > 0);
+	const evidence = await manager.recentEvidence(handle);
+	assert.deepEqual(evidence.lines, ["\u001b[31mfailed\u001b[0m"]);
+	assert.deepEqual(new Set(executables), new Set(["mock-paseo"]));
+	await manager.shutdown();
+});
+
+test("Paseo takes precedence over inherited cmux identity and initializes extension tools", async () => {
+	const previousPaseo = process.env.PASEO_AGENT_ID;
+	const previousCmux = process.env.CMUX_WORKSPACE_ID;
+	const previousPaseoCli = process.env.PASEO_CLI;
+	process.env.PASEO_AGENT_ID = "paseo-agent-test";
+	process.env.CMUX_WORKSPACE_ID = "inherited-cmux-workspace";
+	process.env.PASEO_CLI = "mock-paseo";
+	try {
+		let selectedExecutable = "";
+		const runtimeReader = createRuntimeReadScreen(async (file) => {
+			selectedExecutable = file;
+			return { stdout: JSON.stringify({ terminalId: "terminal:test", lines: ["prompt"], totalLines: 1 }) };
+		});
+		assert.ok(runtimeReader);
+		await runtimeReader("terminal:test");
+		assert.equal(selectedExecutable, "mock-paseo", "Paseo backend is selected instead of cmux");
+
+		type RegisteredTool = { name: string };
+		const tools: string[] = [];
+		terminalObserverExtension({
+			registerTool: (tool: RegisteredTool) => tools.push(tool.name), registerCommand: () => undefined,
+			on: () => undefined, appendEntry: () => undefined, sendMessage: () => undefined,
+		} as never);
+		assert.deepEqual(tools.sort(), ["terminal_observer_ask", "terminal_observer_read", "terminal_observer_start", "terminal_observer_stop", "terminal_observer_wait", "terminal_observer_watch"]);
+	} finally {
+		if (previousPaseo === undefined) delete process.env.PASEO_AGENT_ID; else process.env.PASEO_AGENT_ID = previousPaseo;
+		if (previousCmux === undefined) delete process.env.CMUX_WORKSPACE_ID; else process.env.CMUX_WORKSPACE_ID = previousCmux;
+		if (previousPaseoCli === undefined) delete process.env.PASEO_CLI; else process.env.PASEO_CLI = previousPaseoCli;
+	}
+});
+
+test("direct managers with injected readers work under Paseo", async () => {
+	const previousPaseo = process.env.PASEO_AGENT_ID;
+	process.env.PASEO_AGENT_ID = "paseo-agent-test";
+	try {
+		const baseDir = await mkdtemp(join(tmpdir(), "terminal-observer-direct-paseo-"));
+		const manager = new ObserverManager({ sessionId: "direct", baseDir, readScreen: async () => "ready\nprompt" });
+		await manager.initialize();
+		const { handle } = await manager.start("terminal:test", "screen");
+		assert.deepEqual((await manager.read(handle)).lines, ["ready"]);
+		await manager.shutdown();
+	} finally {
+		if (previousPaseo === undefined) delete process.env.PASEO_AGENT_ID; else process.env.PASEO_AGENT_ID = previousPaseo;
+	}
+});
 
 test("normalization delays the mutable final rendered row", () => {
 	assert.deepEqual(normalizeSnapshot("done  \r\npartial\r\n"), ["done"]);
@@ -78,7 +182,7 @@ test("compact rendering cleans control noise and marks deterministic omissions",
 		gap: true,
 		gapReason: "older output unavailable\u0007",
 	});
-	assert.match(rendered.text, /^\[cmux observer \| mode=compact \| cursor=18 \| lines=11->8 \| omitted=6 \| more=yes \| ended=no \| gap=yes\]/u);
+	assert.match(rendered.text, /^\[terminal observer \| mode=compact \| cursor=18 \| lines=11->8 \| omitted=6 \| more=yes \| ended=no \| gap=yes\]/u);
 	assert.match(rendered.text, /\[gap: older output unavailable\]/u);
 	assert.doesNotMatch(rendered.text, /\u001b|\u0007/u);
 	assert.equal(rendered.omittedLineCount, 6);
@@ -180,7 +284,7 @@ test("raw rendering preserves exact stored lines inside the plain-text envelope"
 	const rendered = renderObserverRead({ lines, cursor: 4, hasMore: false, ended: true, gap: false }, "raw");
 	assert.equal(
 		rendered.text,
-		`[cmux observer | mode=raw | cursor=4 | lines=4 | more=no | ended=yes | gap=no]\n${lines.join("\n")}`,
+		`[terminal observer | mode=raw | cursor=4 | lines=4 | more=no | ended=yes | gap=no]\n${lines.join("\n")}`,
 	);
 	assert.equal(rendered.omittedLineCount, 0);
 	assert.equal(rendered.renderedLineCount, 4);
@@ -189,7 +293,7 @@ test("raw rendering preserves exact stored lines inside the plain-text envelope"
 test("read tool result exposes plain text and compatible structured details", () => {
 	const result = { lines: ["first", "second"], cursor: 2, hasMore: false, ended: false, gap: false };
 	assert.deepEqual(readToolResult(result, "raw"), {
-		content: [{ type: "text", text: "[cmux observer | mode=raw | cursor=2 | lines=2 | more=no | ended=no | gap=no]\nfirst\nsecond" }],
+		content: [{ type: "text", text: "[terminal observer | mode=raw | cursor=2 | lines=2 | more=no | ended=no | gap=no]\nfirst\nsecond" }],
 		details: { ...result, mode: "raw", renderedLineCount: 2, omittedLineCount: 0 },
 	});
 });
@@ -644,7 +748,7 @@ test("extension watch delivery wakes the main agent as a follow-up and persists 
 	screen = "base\nREADY\nprompt\n";
 	await eventually(() => sent.length === 1, 2_000);
 	assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "followUp" });
-	assert.equal((sent[0]?.message as { customType?: string }).customType, "cmux-observer-watch");
+	assert.equal((sent[0]?.message as { customType?: string }).customType, "terminal-observer-watch");
 	assert.equal(entries.length, 2, "candidate and confirmation usage are durably recorded");
 	assert.equal((entries[0] as { action?: string }).action, "watch-usage");
 	assert.doesNotMatch(JSON.stringify(sent[0]?.message), /READY/u);
@@ -1072,26 +1176,27 @@ test("cancel suppresses late usage and rescheduling from an abort-insensitive mo
 	await manager.shutdown();
 });
 
-test("three consecutive screen failures end the observer and wake waits", async () => {
-	const baseDir = await mkdtemp(join(tmpdir(), "cmux-observer-failure-"));
+test("three consecutive Paseo capture failures end the observer and wake waits", async () => {
+	const baseDir = await mkdtemp(join(tmpdir(), "terminal-observer-failure-"));
 	let calls = 0;
+	const readScreen = createPaseoReadScreen("mock-paseo", async () => {
+		calls += 1;
+		if (calls === 1) return { stdout: JSON.stringify({ terminalId: "terminal:test", lines: ["base", "prompt"], totalLines: 2 }) };
+		throw new Error("SECRET_DAEMON_FAILURE");
+	});
 	const manager = new ObserverManager({
 		sessionId: "session-failure",
 		baseDir,
 		pollMs: 10,
-		readScreen: async () => {
-			calls += 1;
-			if (calls === 1) return "base\nprompt\n";
-			throw new Error("surface closed");
-		},
+		readScreen,
 	});
 	await manager.initialize();
-	const { handle } = await manager.start("surface:test", "now");
+	const { handle } = await manager.start("terminal:test", "now");
 	const result = await manager.wait(handle, [{ type: "literal", pattern: "never" }], 1_000);
 	assert.equal(result.matched, false);
 	assert.equal(result.ended, true);
 	assert.equal(result.timedOut, false);
 	assert.equal(manager.list()[0]?.ended, true);
-	assert.match(manager.list()[0]?.endReason ?? "", /surface closed/);
+	assert.equal(manager.list()[0]?.endReason, "surface unavailable: Paseo terminal capture failed");
 	await manager.shutdown();
 });

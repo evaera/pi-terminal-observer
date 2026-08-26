@@ -14,6 +14,53 @@ export const HARD_MAX_CHARS = 20_000;
 export const DEFAULT_SPOOL_BYTES = 1024 * 1024;
 export const DEFAULT_POLL_MS = 250;
 export const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+const SCREEN_CAPTURE_TIMEOUT_MS = 3_000;
+const SCREEN_CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
+
+type ScreenCommandResult = { stdout: string };
+export type ScreenCommandRunner = (file: string, args: string[], options: { encoding: "utf8"; timeout: number; maxBuffer: number }) => Promise<ScreenCommandResult>;
+
+export function isPaseoAgentRuntime(): boolean {
+	return Boolean(process.env.PASEO_AGENT_ID?.trim());
+}
+
+export function createPaseoReadScreen(
+	paseoBin = process.env.PASEO_CLI?.trim() || "paseo",
+	run: ScreenCommandRunner = execFileAsync,
+): (terminalId: string, workspace?: string) => Promise<string> {
+	return async (terminalId) => {
+		let stdout: string;
+		try {
+			({ stdout } = await run(paseoBin, ["terminal", "capture", "--scrollback", "--json", "--", terminalId], {
+				encoding: "utf8",
+				timeout: SCREEN_CAPTURE_TIMEOUT_MS,
+				maxBuffer: SCREEN_CAPTURE_MAX_BYTES,
+			}));
+		} catch {
+			throw new Error("Paseo terminal capture failed");
+		}
+
+		try {
+			const value: unknown = JSON.parse(stdout);
+			if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+			const capture = value as Record<string, unknown>;
+			if (typeof capture.terminalId !== "string"
+				|| !Array.isArray(capture.lines)
+				|| !capture.lines.every((line) => typeof line === "string")
+				|| typeof capture.totalLines !== "number"
+				|| !Number.isSafeInteger(capture.totalLines)
+				|| capture.totalLines < 0) throw new Error();
+			return capture.lines.join("\n");
+		} catch {
+			throw new Error("Paseo terminal capture returned invalid JSON");
+		}
+	};
+}
+
+/** Select the Paseo backend when hosted by Paseo; undefined retains ObserverManager's cmux backend. */
+export function createRuntimeReadScreen(run: ScreenCommandRunner = execFileAsync): ((surface: string, workspace?: string) => Promise<string>) | undefined {
+	return isPaseoAgentRuntime() ? createPaseoReadScreen(process.env.PASEO_CLI?.trim() || "paseo", run) : undefined;
+}
 
 export type ObserverFrom = "now" | "screen";
 
@@ -251,7 +298,7 @@ export function renderObserverRead(result: ObserverReadResult, mode: ObserverRea
 		? `${result.lines.length}->${compacted.lines.length}`
 		: String(result.lines.length);
 	const status = [
-		"cmux observer",
+		"terminal observer",
 		`mode=${mode}`,
 		`cursor=${result.cursor}`,
 		`lines=${counts}`,
@@ -760,7 +807,7 @@ export class ObserverManager {
 
 	constructor(options: ObserverManagerOptions) {
 		this.sessionId = options.sessionId;
-		this.baseDir = options.baseDir ?? join(homedir(), ".local", "state", "pi", "cmux-observer");
+		this.baseDir = options.baseDir ?? join(homedir(), ".local", "state", "pi", "terminal-observer");
 		this.sessionDir = join(this.baseDir, options.sessionId);
 		this.cmuxBin = options.cmuxBin ?? "cmux";
 		this.pollMs = options.pollMs ?? DEFAULT_POLL_MS;

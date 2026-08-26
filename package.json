@@ -1,7 +1,7 @@
 {
-  "name": "pi-cmux-observer",
+  "name": "pi-terminal-observer",
   "version": "0.1.0",
-  "description": "Context-efficient incremental observation of existing cmux terminal surfaces for Pi",
+  "description": "Passive observation of shared cmux and Paseo terminal surfaces for Pi",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -16,6 +16,7 @@
     "pi-package",
     "pi-extension",
     "cmux",
+    "paseo",
     "terminal",
     "observer"
   ],

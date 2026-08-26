@@ -6,12 +6,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/evaera/pi-cmux-observer.git"
+    "url": "git+https://github.com/evaera/pi-terminal-observer.git"
   },
   "bugs": {
-    "url": "https://github.com/evaera/pi-cmux-observer/issues"
+    "url": "https://github.com/evaera/pi-terminal-observer/issues"
   },
-  "homepage": "https://github.com/evaera/pi-cmux-observer#readme",
+  "homepage": "https://github.com/evaera/pi-terminal-observer#readme",
   "keywords": [
     "pi-package",
     "pi-extension",

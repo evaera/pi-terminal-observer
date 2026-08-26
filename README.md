@@ -24,7 +24,7 @@ The `surface` argument is a cmux surface ref or a Paseo terminal ID. `workspace`
 Install directly from GitHub:
 
 ```sh
-pi install git:github.com/evaera/pi-cmux-observer
+pi install git:github.com/evaera/pi-terminal-observer
 ```
 
 For local development, install the project directory instead:
